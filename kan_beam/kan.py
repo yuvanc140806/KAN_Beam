@@ -38,8 +38,10 @@ class BSplineBasis(nn.Module):
         # Initialize: N_{i,0}(x) = 1 if t_i <= x < t_{i+1}, vectorized
         left = t[:M].reshape(1, -1)  # (1, M)
         right = t[1:M+1].reshape(1, -1)  # (1, M)
-        N = ((x_flat >= left) & (x_flat < right)).float()  # (B, M)
-        N[:, -1] = N[:, -1] | (x_flat.squeeze(-1) == t[-1])  # right endpoint
+        mask = (x_flat >= left) & (x_flat < right)  # (B, M) bool
+        # Right endpoint inclusion; keep boolean then cast once
+        mask[:, -1] = mask[:, -1] | (x_flat.squeeze(-1) == t[-1])
+        N = mask.float()
         
         # Recursion: fully vectorized over all basis functions simultaneously
         for k in range(1, p + 1):
