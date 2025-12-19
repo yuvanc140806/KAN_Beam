@@ -41,7 +41,7 @@ class Config:
     lr_schedule: str = "cosine"  # "cosine" or "constant"
     val_interval: int = 2  # validate every N epochs
     use_amp: bool = True  # mixed precision training
-    use_compile: bool = True  # torch.compile optimization
+    use_compile: bool = False  # torch.compile optimization
     num_workers: int = 2  # data loading parallelism
 
 
