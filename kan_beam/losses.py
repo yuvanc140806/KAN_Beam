@@ -7,55 +7,72 @@ def mse_loss(pred_real, pred_imag, true_real, true_imag):
 
 
 def phase_curvature_loss(pred_real, pred_imag, ant_xy, user_pos, wavelength):
-    """Encourage spherical-wave phase relative to geometry.
-    Compare predicted phase with analytic phase -2pi*r/lambda, up to a global offset.
-    ant_xy: (N, 2) antenna planar positions (x, y). z assumed known via user_pos.
-    user_pos: (3,) tensor
+    """Encourage spherical-wave phase relative to geometry (batched).
+    ant_xy: (B, N, 2) or (N, 2)
+    user_pos: (B, 3) or (3,)
     """
     device = pred_real.device
-    N = pred_real.shape[-1]
+    B, N = pred_real.shape
+
+    # Ensure batch dimensions
     ant_xy = ant_xy.to(device)
+    if ant_xy.dim() == 2:
+        ant_xy = ant_xy.unsqueeze(0).expand(B, -1, -1)  # (B, N, 2)
+
     user_pos = user_pos.to(device)
-    z_ant = torch.zeros(N, device=device)
-    ant_pos = torch.cat([ant_xy, z_ant[:, None]], dim=-1)
-    delta = ant_pos - user_pos[None, :]
-    r = torch.linalg.norm(delta, dim=-1)
+    if user_pos.dim() == 1:
+        user_pos = user_pos.unsqueeze(0).expand(B, -1)  # (B, 3)
+
+    z_ant = torch.zeros((B, N, 1), device=device)
+    ant_pos = torch.cat([ant_xy, z_ant], dim=-1)  # (B, N, 3)
+    delta = ant_pos - user_pos[:, None, :]  # (B, N, 3)
+    r = torch.linalg.norm(delta, dim=-1)  # (B, N)
     true_phase = -2.0 * torch.pi * r / wavelength
     pred_phase = torch.atan2(pred_imag, pred_real)
-    # Remove global phase offset by aligning mean difference
+
+    # Remove per-sample global phase offset
     diff = pred_phase - true_phase
-    offset = diff.mean()
+    offset = diff.mean(dim=1, keepdim=True)
     aligned = diff - offset
-    return torch.mean(aligned**2)
+    return torch.mean(aligned ** 2)
 
 
 def amplitude_decay_loss(pred_real, pred_imag, ant_xy, user_pos, wavelength):
     device = pred_real.device
-    N = pred_real.shape[-1]
+    B, N = pred_real.shape
+
     ant_xy = ant_xy.to(device)
+    if ant_xy.dim() == 2:
+        ant_xy = ant_xy.unsqueeze(0).expand(B, -1, -1)  # (B, N, 2)
+
     user_pos = user_pos.to(device)
-    z_ant = torch.zeros(N, device=device)
-    ant_pos = torch.cat([ant_xy, z_ant[:, None]], dim=-1)
-    delta = ant_pos - user_pos[None, :]
-    r = torch.linalg.norm(delta, dim=-1)
+    if user_pos.dim() == 1:
+        user_pos = user_pos.unsqueeze(0).expand(B, -1)  # (B, 3)
+
+    z_ant = torch.zeros((B, N, 1), device=device)
+    ant_pos = torch.cat([ant_xy, z_ant], dim=-1)  # (B, N, 3)
+    delta = ant_pos - user_pos[:, None, :]
+    r = torch.linalg.norm(delta, dim=-1)  # (B, N)
+
     target_amp = 1.0 / torch.clamp(r, min=1e-6)
-    pred_amp = torch.sqrt(pred_real**2 + pred_imag**2)
-    # Scale-invariant comparison (normalize both)
-    target_norm = target_amp / (target_amp.mean() + 1e-9)
-    pred_norm = pred_amp / (pred_amp.mean() + 1e-9)
+    pred_amp = torch.sqrt(pred_real ** 2 + pred_imag ** 2)
+    # Scale-invariant comparison (normalize both per-sample)
+    target_norm = target_amp / (target_amp.mean(dim=1, keepdim=True) + 1e-9)
+    pred_norm = pred_amp / (pred_amp.mean(dim=1, keepdim=True) + 1e-9)
     return torch.mean((pred_norm - target_norm) ** 2)
 
 
 def spatial_smoothness_loss(pred_real, pred_imag, shape):
-    """Total variation across the aperture grid."""
+    """Total variation across the aperture grid (batched)."""
     nx, ny = shape
-    real = pred_real.reshape(nx, ny)
-    imag = pred_imag.reshape(nx, ny)
+    B = pred_real.shape[0]
+    real = pred_real.reshape(B, nx, ny)
+    imag = pred_imag.reshape(B, nx, ny)
     tv = 0.0
-    tv += torch.mean(torch.abs(real[1:, :] - real[:-1, :]))
-    tv += torch.mean(torch.abs(real[:, 1:] - real[:, :-1]))
-    tv += torch.mean(torch.abs(imag[1:, :] - imag[:-1, :]))
-    tv += torch.mean(torch.abs(imag[:, 1:] - imag[:, :-1]))
+    tv += torch.mean(torch.abs(real[:, 1:, :] - real[:, :-1, :]))
+    tv += torch.mean(torch.abs(real[:, :, 1:] - real[:, :, :-1]))
+    tv += torch.mean(torch.abs(imag[:, 1:, :] - imag[:, :-1, :]))
+    tv += torch.mean(torch.abs(imag[:, :, 1:] - imag[:, :, :-1]))
     return tv
 
 
