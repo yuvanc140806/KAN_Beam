@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 from kan_beam.physics import antenna_grid_positions, near_field_channel
 from kan_beam.pilots import generate_pilots, observe_pilots, to_real_imag_features
@@ -153,7 +153,7 @@ def train(cfg: Config):
     opt = optim.Adam(net.parameters(), lr=cfg.lr)
     
     # Mixed precision scaler
-    scaler = GradScaler(enabled=cfg.use_amp and device.type == "cuda")
+    scaler = GradScaler(device.type) if cfg.use_amp and device.type == "cuda" else None
     
     # Learning rate scheduler
     if cfg.lr_schedule == "cosine":
@@ -163,11 +163,11 @@ def train(cfg: Config):
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=(device.type == "cuda")
+        num_workers=0, pin_memory=(device.type == "cuda")  # num_workers=0 for GPU tensors
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=(device.type == "cuda")
+        num_workers=0, pin_memory=(device.type == "cuda")  # num_workers=0 for GPU tensors
     )
 
     def split(vec):
@@ -195,7 +195,7 @@ def train(cfg: Config):
             user = user.to(device)
 
             # Mixed precision forward pass
-            with autocast(enabled=cfg.use_amp and device.type == "cuda"):
+            with autocast(device_type=device.type, enabled=cfg.use_amp):
                 pred = net(feats)
                 pr, pi = split(pred)
                 tr, ti = split(target)
@@ -209,9 +209,13 @@ def train(cfg: Config):
                 )
 
             opt.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
             train_loss_total += loss.item() * feats.shape[0]
         
         train_loss_avg = train_loss_total / len(train_ds)
