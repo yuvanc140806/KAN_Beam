@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import autocast, GradScaler
 
 from kan_beam.physics import antenna_grid_positions, near_field_channel
 from kan_beam.pilots import generate_pilots, observe_pilots, to_real_imag_features
@@ -29,15 +30,19 @@ class Config:
     noise_var: float = 1e-3
     samples: int = 512
     val_samples: int = 128
-    epochs: int = 50
-    batch_size: int = 32
+    epochs: int = 30  # reduced for faster training
+    batch_size: int = 64  # larger batch for GPU efficiency
     width: int = 256
     depth: int = 3
     K: int = 16
-    device: str = "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # auto-detect GPU
     patience: int = 5  # early stopping patience
     lr: float = 1e-3
     lr_schedule: str = "cosine"  # "cosine" or "constant"
+    val_interval: int = 2  # validate every N epochs
+    use_amp: bool = True  # mixed precision training
+    use_compile: bool = True  # torch.compile optimization
+    num_workers: int = 2  # data loading parallelism
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -79,6 +84,10 @@ class Dataset(torch.utils.data.Dataset):
 
 def train(cfg: Config):
     device = torch.device(cfg.device)
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     # Create datasets
     train_ds = Dataset(cfg, seed=42)
@@ -86,7 +95,16 @@ def train(cfg: Config):
     
     n_ant = cfg.nx * cfg.ny
     net = ChannelEstimator(n_ant=n_ant, L=cfg.L, width=cfg.width, depth=cfg.depth, K=cfg.K).to(device)
+    
+    # torch.compile for 1.5-2x speedup (PyTorch 2.0+)
+    if cfg.use_compile and hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile...")
+        net = torch.compile(net)
+    
     opt = optim.Adam(net.parameters(), lr=cfg.lr)
+    
+    # Mixed precision scaler
+    scaler = GradScaler(enabled=cfg.use_amp and device.type == "cuda")
     
     # Learning rate scheduler
     if cfg.lr_schedule == "cosine":
@@ -94,8 +112,14 @@ def train(cfg: Config):
     else:
         scheduler = None
 
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=(device.type == "cuda")
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=(device.type == "cuda")
+    )
 
     def split(vec):
         N = n_ant
@@ -121,49 +145,57 @@ def train(cfg: Config):
             ant_xy = ant_xy.to(device)
             user = user.to(device)
 
-            pred = net(feats)
-            pr, pi = split(pred)
-            tr, ti = split(target)
-
-            loss = physics_informed_loss(
-                pr, pi, tr, ti, ant_xy, user, cfg.wavelength, train_ds.shape,
-                w_mse=loss_weights["mse"],
-                w_phase=loss_weights["phase"],
-                w_amp=loss_weights["amp"],
-                w_smooth=loss_weights["smooth"]
-            )
-
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            train_loss_total += loss.item() * feats.shape[0]
-        
-        train_loss_avg = train_loss_total / len(train_ds)
-        
-        # ===== Validation =====
-        net.eval()
-        val_loss_total = 0.0
-        with torch.no_grad():
-            for feats, target, ant_xy, user in val_loader:
-                feats = feats.to(device)
-                target = target.to(device)
-                ant_xy = ant_xy.to(device)
-                user = user.to(device)
-
+            # Mixed precision forward pass
+            with autocast(enabled=cfg.use_amp and device.type == "cuda"):
                 pred = net(feats)
                 pr, pi = split(pred)
                 tr, ti = split(target)
 
                 loss = physics_informed_loss(
-                    pr, pi, tr, ti, ant_xy, user, cfg.wavelength, val_ds.shape,
+                    pr, pi, tr, ti, ant_xy, user, cfg.wavelength, train_ds.shape,
                     w_mse=loss_weights["mse"],
                     w_phase=loss_weights["phase"],
                     w_amp=loss_weights["amp"],
                     w_smooth=loss_weights["smooth"]
                 )
-                val_loss_total += loss.item() * feats.shape[0]
+
+            opt.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            train_loss_total += loss.item() * feats.shape[0]
         
-        val_loss_avg = val_loss_total / len(val_ds)
+        train_loss_avg = train_loss_total / len(train_ds)
+        
+        # ===== Validation (less frequent) =====
+        should_validate = (epoch % cfg.val_interval == 0) or (epoch == cfg.epochs - 1)
+        if should_validate:
+            net.eval()
+            val_loss_total = 0.0
+            with torch.no_grad():
+                for feats, target, ant_xy, user in val_loader:
+                    feats = feats.to(device)
+                    target = target.to(device)
+                    ant_xy = ant_xy.to(device)
+                    user = user.to(device)
+
+                    pred = net(feats)
+                    pr, pi = split(pred)
+                    tr, ti = split(target)
+
+                    loss = physics_informed_loss(
+                        pr, pi, tr, ti, ant_xy, user, cfg.wavelength, val_ds.shape,
+                        w_mse=loss_weights["mse"],
+                        w_phase=loss_weights["phase"],
+                        w_amp=loss_weights["amp"],
+                        w_smooth=loss_weights["smooth"]
+                    )
+                    val_loss_total += loss.item() * feats.shape[0]
+            
+            val_loss_avg = val_loss_total / len(val_ds)
+        else:
+            val_loss_avg = best_val_loss  # use last known
+        
         dt = time.time() - t0
         
         # Learning rate schedule step
@@ -176,15 +208,16 @@ def train(cfg: Config):
             loss_weights["phase"] = min(0.5, loss_weights["phase"] * 1.05)
             loss_weights["amp"] = min(0.5, loss_weights["amp"] * 1.05)
         
-        # Early stopping
-        if val_loss_avg < best_val_loss:
+        # Early stopping (only on validation epochs)
+        if should_validate and val_loss_avg < best_val_loss:
             best_val_loss = val_loss_avg
             patience_counter = 0
             best_state = {k: v.clone() for k, v in net.state_dict().items()}
-        else:
+        elif should_validate:
             patience_counter += 1
         
-        print(f"E{epoch+1:2d} | train_loss {train_loss_avg:.4f} | val_loss {val_loss_avg:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {dt:.1f}s")
+        val_str = f"val_loss {val_loss_avg:.4f}" if should_validate else "(skipped)"
+        print(f"E{epoch+1:2d} | train_loss {train_loss_avg:.4f} | {val_str} | lr {opt.param_groups[0]['lr']:.2e} | {dt:.1f}s")
         
         if patience_counter >= cfg.patience:
             print(f"Early stopping at epoch {epoch+1}")
