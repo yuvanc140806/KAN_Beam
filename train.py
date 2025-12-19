@@ -48,6 +48,9 @@ class Config:
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, cfg: Config, seed: int = 42):
         super().__init__()
+        print(f"Pre-computing dataset (seed={seed})...")
+        device = torch.device(cfg.device)
+        
         rng = np.random.default_rng(seed)
         ant_pos, shape = antenna_grid_positions(cfg.nx, cfg.ny, cfg.dx, cfg.dy)
         self.ant_pos = ant_pos
@@ -55,30 +58,76 @@ class Dataset(torch.utils.data.Dataset):
         self.wavelength = cfg.wavelength
         self.L = cfg.L
         self.noise_var = cfg.noise_var
-        # random user positions in front of array (z>0)
+        self.device = device
+        
+        # Generate user positions (CPU)
         users = []
         for _ in range(cfg.samples):
             x = rng.uniform(-cfg.nx * cfg.dx / 2, cfg.nx * cfg.dx / 2)
             y = rng.uniform(-cfg.ny * cfg.dy / 2, cfg.ny * cfg.dy / 2)
             z = rng.uniform(0.5, 3.0)
             users.append(np.array([x, y, z], dtype=np.float32))
-        self.users = np.stack(users, axis=0)
-        self.pilots = generate_pilots(cfg.L, power=1.0, seed=123)
+        self.users = np.stack(users, axis=0)  # (S, 3)
+        
+        # GPU tensors for batch computation
+        ant_pos_torch = torch.from_numpy(ant_pos).float().to(device)  # (N, 3)
+        users_torch = torch.from_numpy(self.users).float().to(device)  # (S, 3)
+        pilots = generate_pilots(cfg.L, power=1.0, seed=123)
+        pilots_torch = torch.from_numpy(pilots).to(device)  # (L,) complex
+        
+        # Pre-compute all channels and observations on GPU
+        N = ant_pos.shape[0]
+        S = self.users.shape[0]
+        
+        t0 = time.time()
+        
+        # Batch channel computation on GPU
+        # Distance: (S, N)
+        delta = ant_pos_torch[None, :, :] - users_torch[:, None, :]  # (S, N, 3)
+        r = torch.linalg.norm(delta, dim=-1)  # (S, N)
+        
+        # Phase and amplitude (vectorized on GPU)
+        PI2 = 2.0 * torch.pi
+        phase = -PI2 * r / self.wavelength
+        amp = 1.0 / torch.clamp(r, min=1e-6)
+        h_batch = amp * torch.exp(1j * phase)  # (S, N) complex
+        
+        # Pilot observations (batch)
+        Y_batch = h_batch[:, :, None] * pilots_torch[None, None, :]  # (S, N, L)
+        
+        # Add noise
+        if self.noise_var > 0.0:
+            noise = (torch.randn(S, N, cfg.L, device=device) * np.sqrt(self.noise_var / 2) +
+                     1j * torch.randn(S, N, cfg.L, device=device) * np.sqrt(self.noise_var / 2))
+            Y_batch = Y_batch + noise
+        
+        # Convert to real/imag features: (S, 2*N*L)
+        feats_batch = torch.cat([Y_batch.real, Y_batch.imag], dim=1).reshape(S, -1)
+        
+        # Convert channels to real/imag targets: (S, 2*N)
+        targets_batch = torch.cat([h_batch.real, h_batch.imag], dim=1)
+        
+        # Antenna positions (shared, (N, 2))
+        ant_xy = torch.from_numpy(ant_pos[:, :2]).float().to(device)
+        
+        # Store as GPU tensors
+        self.feats = feats_batch
+        self.targets = targets_batch
+        self.ant_xy = ant_xy  # shared
+        self.users_torch = users_torch
+        
+        dt = time.time() - t0
+        print(f"Dataset pre-computation done in {dt:.1f}s on {device}")
 
     def __len__(self):
-        return self.users.shape[0]
+        return self.feats.shape[0]
 
     def __getitem__(self, idx):
-        user = self.users[idx]
-        h, r = near_field_channel(self.ant_pos, user, self.wavelength)
-        Y = observe_pilots(h, self.pilots, noise_var=self.noise_var)
-        feats = to_real_imag_features(Y)
-        target = np.concatenate([h.real, h.imag], axis=0).astype(np.float32)
         return (
-            torch.from_numpy(feats),
-            torch.from_numpy(target),
-            torch.from_numpy(self.ant_pos[:, :2].astype(np.float32)),  # ant_xy
-            torch.from_numpy(user.astype(np.float32)),
+            self.feats[idx],
+            self.targets[idx],
+            self.ant_xy,
+            self.users_torch[idx],
         )
 
 
