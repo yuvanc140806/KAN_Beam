@@ -163,11 +163,11 @@ def train(cfg: Config):
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=0, pin_memory=(device.type == "cuda")  # num_workers=0 for GPU tensors
+        num_workers=0, pin_memory=False  # pin_memory=False since data is already on GPU
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=0, pin_memory=(device.type == "cuda")  # num_workers=0 for GPU tensors
+        num_workers=0, pin_memory=False  # pin_memory=False since data is already on GPU
     )
 
     def split(vec):
